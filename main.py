@@ -33,13 +33,13 @@ warnings.filterwarnings("ignore", category=UserWarning)
 
 def get_args_parser():
     parser = argparse.ArgumentParser('DeiT training and evaluation script', add_help=False)
-    parser.add_argument('--model_name',default="TALL_SWIN")
+    parser.add_argument('--model_name',default="TALL_NPR_SWIN")
     parser.add_argument('--batch-size', default=2, type=int)
     parser.add_argument('--epochs', default=30, type=int)
 
     # Dataset parameters
-    parser.add_argument('--data_txt_dir', type=str,default='##path_for_dataset_txt##', help='path to text of dataset')
-    parser.add_argument('--data_dir', type=str,default="##path_for_dataset##", help='path to dataset')
+    parser.add_argument('--data_txt_dir', type=str,default='text_folder', help='path to text of dataset')
+    parser.add_argument('--data_dir', type=str,default="./data", help='path to dataset')
     parser.add_argument('--dataset', default='ffpp_train',
                         choices=list(DATASET_CONFIG.keys()), help='path to dataset file list')
     parser.add_argument('--duration', default=8, type=int, help='number of frames')
@@ -85,7 +85,7 @@ def get_args_parser():
     parser.add_argument('--hpe_to_token', default=False, action='store_true',
                         help='add hub position embedding to image tokens')
     # Model parameters
-    parser.add_argument('--model', default='TALL_SWIN', type=str, metavar='MODEL',
+    parser.add_argument('--model', default='TALL_NPR_SWIN', type=str, metavar='MODEL',
                         help='Name of model to train')
     parser.add_argument('--input-size', default=224, type=int, help='images input size')
 
@@ -222,6 +222,8 @@ def get_args_parser():
 
     parser.add_argument('--hard_contrastive', action='store_true', help='use HEXA')
     # parser.add_argument('--selfdis_w', type=float, default=0., help='enable self distillation')
+    parser.add_argument('--npr_model_path',default="./NPR.pth")
+    parser.add_argument('--tall_model_path',default="./checkpoint12.pth")
 
     return parser
 
@@ -281,7 +283,9 @@ def main(args):
         drop_rate=args.drop,
         drop_path_rate=args.drop_path,
         drop_block_rate=args.drop_block,
-        use_checkpoint=args.use_checkpoint
+        use_checkpoint=args.use_checkpoint,
+        npr_model_path=args.npr_model_path,
+        tall_model_path=args.tall_model_path
     )
 
     # TODO: finetuning
