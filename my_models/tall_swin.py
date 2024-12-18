@@ -15,9 +15,23 @@ from torch.hub import load_state_dict_from_url
 import logging
 from einops import rearrange
 import math
+import utils
+
+import torch.utils.model_zoo as model_zoo
+from torch.nn import functional as F
+from typing import Any, cast, Dict, List, Optional, Union
+import numpy as np
 
 _logger = logging.getLogger(__name__)
 
+
+
+
+
+
+
+#------------------------------------thumbnail-transformer-----------------------------------------------
+#--------------------------------------------------------------------------------------------------------
 
 def _cfg(url='', **kwargs):
     return {
@@ -696,13 +710,14 @@ class SwinTransformer(nn.Module):
         for layer in self.layers:
             x = layer(x)
 
-        x = self.norm(x)  # B L C
-        x = self.avgpool(x.transpose(1, 2))  # B C 1
-        x = torch.flatten(x, 1)
+        x = self.norm(x)  # B L C   B   49  1024
+
         return x
 
     def forward(self, x):
         x = self.forward_features(x)
+        x = self.avgpool(x.transpose(1, 2))  # B C 1
+        x = torch.flatten(x, 1)
         x = self.head(x)
         if not self.image_mode:
             x = x.view(-1, self.duration, self.num_classes)
@@ -717,6 +732,16 @@ class SwinTransformer(nn.Module):
         flops += self.num_features * self.patches_resolution[0] * self.patches_resolution[1] // (2 ** self.num_layers)
         flops += self.num_features * self.num_classes
         return flops
+
+
+
+
+
+
+
+
+
+
 
 
 def load_pretrained(model, cfg=None, num_classes=1000, in_chans=3, filter_fn=None, img_size=224, num_patches=196,
@@ -864,7 +889,7 @@ def _conv_filter(state_dict, patch_size=4):
     return out_dict
 
 
-def _create_vision_transformer(variant, pretrained=False, pretrained_window_size=7, **kwargs):
+def _create_vision_transformer(variant, pretrained=True, pretrained_window_size=7, **kwargs):
     default_cfg = default_cfgs[variant]
     default_num_classes = default_cfg['num_classes']
     default_img_size = default_cfg['input_size'][-1]
@@ -884,14 +909,431 @@ def _create_vision_transformer(variant, pretrained=False, pretrained_window_size
             filter_fn=_conv_filter,
             img_size=img_size,
             pretrained_window_size=pretrained_window_size,
-            pretrained_model=''
+            pretrained_model=''            ##可以在这里添加预训练权重本地路径，若不添加则从默认的URL（见开头）加载
         )
     return model
 
 
 
+
+#-----------------------------------------npr-resnet50---------------------------------------------------
+#--------------------------------------------------------------------------------------------------------
+
+def conv3x3(in_planes, out_planes, stride=1):
+    """3x3 convolution with padding"""
+    return nn.Conv2d(in_planes, out_planes, kernel_size=3, stride=stride,
+                     padding=1, bias=False)
+
+
+def conv1x1(in_planes, out_planes, stride=1):
+    """1x1 convolution"""
+    return nn.Conv2d(in_planes, out_planes, kernel_size=1, stride=stride, bias=False)
+
+
+class BasicBlock(nn.Module):
+    expansion = 1
+
+    def __init__(self, inplanes, planes, stride=1, downsample=None):
+        super(BasicBlock, self).__init__()
+        self.conv1 = conv3x3(inplanes, planes, stride)
+        self.bn1 = nn.BatchNorm2d(planes)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = conv3x3(planes, planes)
+        self.bn2 = nn.BatchNorm2d(planes)
+        self.downsample = downsample
+        self.stride = stride
+
+    def forward(self, x):
+        identity = x
+
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+
+        out = self.conv2(out)
+        out = self.bn2(out)
+
+        if self.downsample is not None:
+            identity = self.downsample(x)
+
+        out += identity
+        out = self.relu(out)
+
+        return out
+
+
+class Bottleneck(nn.Module):
+    expansion = 4
+
+    def __init__(self, inplanes, planes, stride=1, downsample=None):
+        super(Bottleneck, self).__init__()
+        self.conv1 = conv1x1(inplanes, planes)
+        self.bn1 = nn.BatchNorm2d(planes)
+        self.conv2 = conv3x3(planes, planes, stride)
+        self.bn2 = nn.BatchNorm2d(planes)
+        self.conv3 = conv1x1(planes, planes * self.expansion)
+        self.bn3 = nn.BatchNorm2d(planes * self.expansion)
+        self.relu = nn.ReLU(inplace=True)
+        self.downsample = downsample
+        self.stride = stride
+
+    def forward(self, x):
+        identity = x
+
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+
+        out = self.conv2(out)
+        out = self.bn2(out)
+        out = self.relu(out)
+
+        out = self.conv3(out)
+        out = self.bn3(out)
+
+        if self.downsample is not None:
+            identity = self.downsample(x)
+
+        out += identity
+        out = self.relu(out)
+
+        return out
+
+
+class ResNet(nn.Module):
+
+    def __init__(self, block, layers, num_classes=1, zero_init_residual=False, duration=8,thumbnail_rows=1):
+        super(ResNet, self).__init__()
+
+        self.duration = duration
+        self.frame_padding = self.duration % thumbnail_rows #if self.image_mode is True else 0
+        if self.frame_padding != 0:
+            self.frame_padding = self.thumbnail_rows - self.frame_padding
+            self.duration += self.frame_padding
+        self.inplanes = 64
+        self.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=2, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(64)
+        self.relu = nn.ReLU(inplace=True)
+        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+        self.layer1 = self._make_layer(block, 64, layers[0])
+        self.layer2 = self._make_layer(block, 128, layers[1], stride=2)
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        self.fc1 = nn.Linear(128 * block.expansion, num_classes)
+
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out',
+                                        nonlinearity='relu')
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+
+        # Zero-initialize
+        if zero_init_residual:
+            for m in self.modules():
+                if isinstance(m, Bottleneck):
+                    nn.init.constant_(m.bn3.weight, 0)
+                elif isinstance(m, BasicBlock):
+                    nn.init.constant_(m.bn2.weight, 0)
+
+    def pad_frames(self, x):
+        frame_num = self.duration - self.frame_padding
+        x = x.view((-1, 3 * frame_num) + x.size()[2:])
+        x_padding = torch.zeros(
+            (x.shape[0], 3 * self.frame_padding) + x.size()[2:]).to(x.device)
+        x = torch.cat((x, x_padding), dim=1)
+        assert x.shape[
+                   1] == 3 * self.duration, f"Frame number {x.shape[1]} not equal to adjusted input size {3 * self.duration}"
+        return x
+
+    def _make_layer(self, block, planes, blocks, stride=1):
+        downsample = None
+        if stride != 1 or self.inplanes != planes * block.expansion:
+            downsample = nn.Sequential(
+                conv1x1(self.inplanes, planes * block.expansion,
+                        stride),
+                nn.BatchNorm2d(planes * block.expansion),
+            )
+
+        layers = []
+        layers.append(block(self.inplanes, planes, stride,
+                            downsample))
+        self.inplanes = planes * block.expansion
+        for _ in range(1, blocks):
+            layers.append(block(self.inplanes, planes))
+
+        return nn.Sequential(*layers)
+
+    def interpolate(self, img, factor):
+        return F.interpolate(F.interpolate(img, scale_factor=factor, mode='nearest', recompute_scale_factor=True),
+                             scale_factor=1 / factor, mode='nearest', recompute_scale_factor=True)
+
+    def forward_features(self, x):
+        # 调整输入数据格式
+        if self.frame_padding > 0:
+            x = self.pad_frames(x)
+        else:
+            x = x.view((-1, 3 * self.duration) + x.size()[2:])
+            
+        x=rearrange(x,f'b (d c) H W -> (b d) c H W',d=self.duration,c=3)
+
+        # 保持原有的前向传播过程，但不包括分类头
+        NPR = x - self.interpolate(x, 0.5)
+
+        x = self.conv1(NPR * 2.0 / 3.0)
+        x = self.bn1(x)
+        x = self.relu(x)
+        x = self.maxpool(x)
+
+        x = self.layer1(x)
+        x = self.layer2(x)       #B*d 512 14 14
+
+
+
+        return x  # 返回特征
+
+    def forward(self, x):
+        x = self.avgpool(x)
+
+        x = x.view(x.size(0), -1)
+
+        x=rearrange(x,f'(b d) f -> b (d f)',d=self.duration)
+
+
+        x = self.forward_features(x)
+        x = self.fc1(x)
+        return x
+
+
+
+def resnet50( **kwargs):
+    """构建 ResNet-50 模型"""
+    model = ResNet(Bottleneck, [3, 4, 6, 3], num_classes=kwargs['num_classes'], duration=kwargs['duration'],thumbnail_rows=kwargs['thumbnail_rows'])
+    model.load_state_dict(torch.load(kwargs.pop('npr_model_path'), map_location='cpu')['model'], strict=False)
+    return model
+
+
+
+
+
+# 定义一维位置编码模块（固定）
+class PositionalEncoding1D(nn.Module):
+    def __init__(self, embed_size, max_len=5000):
+        super(PositionalEncoding1D, self).__init__()
+        pe = torch.zeros(max_len, embed_size)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, embed_size, 2).float() * (-math.log(10000.0) / embed_size))
+        pe[:, 0::2] = torch.sin(position * div_term)  # 偶数维度
+        pe[:, 1::2] = torch.cos(position * div_term)  # 奇数维度
+        pe = pe.unsqueeze(0)  # [1, max_len, embed_size]
+        self.register_buffer('pe', pe)
+
+    def forward(self, x):
+        """
+        x: [B, N, E]
+        """
+        N = x.size(1)
+        x = x + self.pe[:, :N, :].to(x.device)
+        return x
+    
+    
+
+class MultiHeadAttention(nn.Module):
+    def __init__(self,embed_size,heads,dropout):
+        super(MultiHeadAttention, self).__init__()
+        self.embed_size=embed_size
+        self.heads=heads
+        self.head_size=embed_size//heads
+
+
+        self.v_linear=nn.Linear(embed_size,embed_size)
+        self.q_linear=nn.Linear(embed_size,embed_size)
+        self.k_linear=nn.Linear(embed_size,embed_size)
+
+        self.dropout=nn.Dropout(dropout)
+        self.fc_out=nn.Linear(embed_size,embed_size)
+    
+    def forward(self,q,k,v):
+        
+        Q=self.q_linear(q)
+        K=self.k_linear(k)
+        V=self.v_linear(v)
+
+        Q=rearrange(Q,'b q (h d)->b h q d',h=self.heads)
+        K=rearrange(K,'b k (h d)->b h k d',h=self.heads)
+        V=rearrange(V,'b v (h d)->b h v d',h=self.heads)
+
+        scores=torch.einsum('bhqd,bhkd->bhqk',[Q,K])
+
+        attention=torch.softmax(scores/(self.head_size**(1/2)),dim=-1)
+        attention=self.dropout(attention)
+
+        # 维度kv是一样的
+        out=torch.einsum('bhqv,bhvd->bhqd',[attention,V])
+        out=rearrange(out,'b h q d->b q (h d)')
+
+        out=self.fc_out(out)
+        return out
+
+
+class FFC(nn.Module):
+    def __init__(self,embed_size,dropout=0.1):
+        super(FFC, self).__init__()
+        self.linear1=nn.Linear(embed_size,4*embed_size)
+        self.linear2=nn.Linear(4*embed_size,embed_size)
+        self.dropout=nn.Dropout(dropout)
+
+    def forward(self,x):
+        x=self.linear1(x)
+        x=F.relu(x)
+        x=self.dropout(x)
+        x=self.linear2(x)
+
+        return x
+
+class Self_Attention_block(nn.Module):
+    def __init__(self,embed_size,heads,dropout=0.1):
+        super(Self_Attention_block, self).__init__()
+        self.attn=MultiHeadAttention(embed_size,heads,dropout)
+        self.feed_forward=FFC(embed_size,dropout)
+
+        self.norm1=nn.LayerNorm(embed_size)
+        self.norm2=nn.LayerNorm(embed_size)
+
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+
+    def forward(self,x):
+
+        attn_output= self.attn(q=x, k=x, v=x)
+        x = x + self.dropout1(attn_output)
+        x = self.norm1(x)
+
+        # 前馈网络子层 + 残差 & LayerNorm
+        ff_output = self.feed_forward(x)
+        x = x + self.dropout2(ff_output)
+        x = self.norm2(x)
+
+        return x 
+
+
+class Cross_Attention_block(nn.Module):
+    def __init__(self,embed_size,heads,dropout=0.1):
+        super(Cross_Attention_block, self).__init__()
+        self.attn=MultiHeadAttention(embed_size,heads,dropout)
+        self.feed_forward=FFC(embed_size,dropout)
+
+        self.norm1=nn.LayerNorm(embed_size)
+        self.norm2=nn.LayerNorm(embed_size)
+
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+
+    def forward(self,f1,f2):
+        x=f1
+        attn_output = self.attn(q=x, k=f2, v=f2)
+        x = x + self.dropout1(attn_output)
+        x = self.norm1(x)
+
+        # 前馈网络子层 + 残差 & LayerNorm
+        ff_output = self.feed_forward(x)
+        x = x + self.dropout2(ff_output)
+        x = self.norm2(x)
+
+        return x 
+
+
+
+
+
+class CombinedModel(nn.Module):
+    def __init__(self, pretrained=False,num_self_att=3,**kwargs):
+        super(CombinedModel, self).__init__()
+
+        self.num_classes=kwargs['num_classes']
+        self.duration=kwargs['duration']
+
+
+        
+        # 初始化 ResNet 模型
+        self.npr_resnet_model = resnet50(
+            **kwargs
+        )
+
+        # 初始化 SwinTransformer 模型
+        self.thu_swintf_model = _create_vision_transformer('swin_base_patch4_window7_224_22k',
+                                                       pretrained=pretrained,
+                                                       
+                                                       **kwargs)
+        tall_checkpoint = torch.load(kwargs['tall_model_path'], map_location='cpu')
+        utils.load_checkpoint(self.thu_swintf_model, tall_checkpoint['model'])
+
+
+        # 冻结两个模型的所有参数
+        for param in self.npr_resnet_model.parameters():
+            param.requires_grad = False
+        for param in self.thu_swintf_model.parameters():
+            param.requires_grad = False
+
+
+        
+        self.num_features=self.thu_swintf_model.num_features
+
+               
+        
+
+        self.npr_avgpool = nn.AdaptiveAvgPool2d((7, 7))
+        
+        #特征对齐
+        self.feature_matching=nn.Linear(512*self.duration,self.num_features)
+        
+        
+        
+        self.positional_encoding = PositionalEncoding1D(embed_size=self.num_features, max_len=49)
+        # 定义归一化层
+        self.layer_norm = nn.LayerNorm(self.num_features)
+        
+
+        self.cross_att_block = Cross_Attention_block(self.num_features, 8, 0.1)
+        self.self_att_blocks = nn.ModuleList([Self_Attention_block(self.num_features, 8, 0.1) 
+                                              for _ in range(num_self_att)])     
+
+        self.avgpool1d = nn.AdaptiveAvgPool1d(1)
+
+        self.head=nn.Linear(self.num_features,self.num_classes)
+
+
+    def forward(self, x):
+        # 同时传递输入数据给两个模型的特征提取部分
+        swin_features = self.thu_swintf_model.forward_features(x)  # [B, 49,1024]
+        resnet_features = self.npr_resnet_model.forward_features(x)  # [B*d,512,14,14]
+
+        resnet_features=self.npr_avgpool(resnet_features)     #[B*d,512,7,7]
+
+
+        resnet_features=rearrange(resnet_features,'(b d) c h w->b (h w) (d c)',d=self.duration)  #[B,49,d*512]
+        resnet_features=self.feature_matching(resnet_features)     #[B,49,1024]
+        
+        resnet_features = self.layer_norm(resnet_features)  # [B, 49, 1024]
+
+        # 添加位置编码
+        resnet_features = self.positional_encoding(resnet_features)  # [B, 49, 1024]
+
+
+        x = self.cross_att_block(resnet_features, swin_features)
+        
+        for block in self.self_att_blocks:
+            x = block(x)                        #[B,49,1024]      
+
+        x = self.avgpool1d(x.transpose(1, 2))  # [B 1024 1]
+        x = torch.flatten(x, 1)       #[B,1024] 
+        x = self.head(x)
+
+        return x
+        
+
 @register_model
-def TALL_SWIN(pretrained=False, **kwargs):
+def TALL_NPR_SWIN(pretrained=False, **kwargs):
     """ ViT-Base (ViT-B/16) from original paper (https://arxiv.org/abs/2010.11929).
     ImageNet-1k weights fine-tuned from in21k @ 224x224, source https://github.com/google-research/vision_transformer.
     """
@@ -921,6 +1363,7 @@ def TALL_SWIN(pretrained=False, **kwargs):
     model_kwargs = dict(patch_size=patch_size, window_size=window_size, embed_dim=embed_dim, depths=depths, num_heads=num_heads, mlp_ratio=mlp_ratio,
                         use_checkpoint=use_checkpoint, ape=ape, bottleneck=bottleneck, **kwargs)
     print(model_kwargs)
-    model = _create_vision_transformer('swin_base_patch4_window7_224_22k', pretrained=pretrained, pretrained_window_size=7, **model_kwargs)
+    model = CombinedModel( pretrained=pretrained, pretrained_window_size=7, **model_kwargs)
+    model.default_cfg = model.thu_swintf_model.default_cfg
     return model
 
